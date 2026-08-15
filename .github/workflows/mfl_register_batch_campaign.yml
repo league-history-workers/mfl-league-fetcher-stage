@@ -1,0 +1,580 @@
+name: MFL Register Batch Campaign
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_path:
+        description: 'Private checkout manifest containing season-scoped MFL rows'
+        required: false
+        type: string
+        default: corpus_seed/mfl_population_manifest_2004_2018_expanded.json
+      yahoo_oauth_ref:
+        description: 'Private pipeline ref containing importer and batch driver'
+        required: false
+        type: string
+        default: codex/mfl-gates
+      batch_start:
+        description: 'First batch number in this wave'
+        required: false
+        type: string
+        default: '0'
+      batch_count:
+        description: 'Number of batches in this wave'
+        required: false
+        type: string
+        default: '16'
+      batch_size:
+        description: 'Leagues processed sequentially by one runner'
+        required: false
+        type: string
+        default: '16'
+      max_parallel:
+        description: 'Concurrent batch runners; each runner has its own MFL limiter'
+        required: false
+        type: string
+        default: '20'
+      cache_namespace:
+        description: 'Immutable Actions cache namespace'
+        required: false
+        type: string
+        default: mfl-population-batch-v1
+      continue_population:
+        description: 'Dispatch the next batch wave after a successful combine'
+        required: false
+        type: string
+        default: 'false'
+      collect_all:
+        description: 'Process every manifest row; ignore the per-year target stop condition'
+        required: false
+        type: string
+        default: 'false'
+      prior_state_key:
+        description: 'Exact cumulative-state cache key from the preceding wave'
+        required: false
+        type: string
+        default: ''
+      prior_index_key:
+        description: 'Exact immutable chunk-index cache key from the preceding wave'
+        required: false
+        type: string
+        default: ''
+      storage_mode:
+        description: 'Cache storage mode'
+        required: false
+        type: string
+        default: 'chunked'
+      population_total:
+        description: 'Total candidate rows in the manifest'
+        required: false
+        type: string
+        default: '0'
+      accepted_by_year:
+        description: 'Cumulative accepted receipts from previous waves'
+        required: false
+        type: string
+        default: '{}'
+      target_per_year:
+        description: 'Accepted target per required year'
+        required: false
+        type: string
+        default: '10000'
+      target_years:
+        description: 'Comma-separated required years'
+        required: false
+        type: string
+        default: '2005,2006,2007,2008,2009,2010,2011,2012,2013,2014,2015,2016,2017,2018'
+      mfl_rate_limit:
+        description: 'Per-runner MFL requests/minute; keep aggregate below MFL throttle'
+        required: false
+        type: string
+        default: '6'
+      start_stagger_seconds:
+        description: 'Delay each matrix batch to avoid synchronized MFL bursts'
+        required: false
+        type: string
+        default: '15'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      records: ${{ steps.manifest.outputs.records }}
+      batches: ${{ steps.manifest.outputs.batches }}
+      max_parallel: ${{ steps.manifest.outputs.max_parallel }}
+    steps:
+      - name: Checkout private manifest
+        uses: actions/checkout@v5
+        with:
+          repository: jeleff1000/yahoo_oauth
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.yahoo_oauth_ref }}
+          path: code
+          filter: blob:none
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /corpus_seed/
+      - name: Select wave batches
+        id: manifest
+        env:
+          MANIFEST: code/${{ inputs.manifest_path }}
+          START: ${{ inputs.batch_start }}
+          COUNT: ${{ inputs.batch_count }}
+          SIZE: ${{ inputs.batch_size }}
+          MAX: ${{ inputs.max_parallel }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          d=json.load(open(os.environ['MANIFEST'], encoding='utf-8'))
+          rows=d.get('rows', d.get('leagues', d))
+          start=int(os.environ['START']); count=int(os.environ['COUNT']); size=int(os.environ['SIZE'])
+          end=min(len(rows), (start+count)*size)
+          selected=rows[start*size:end]
+          batches=list(range(start, start+((len(selected)+size-1)//size)))
+          print('records='+json.dumps(selected,separators=(',',':')))
+          print('batches='+json.dumps(batches,separators=(',',':')))
+          print('max_parallel='+str(min(max(1,int(os.environ['MAX'])),len(batches))))
+          PY
+
+  ingest:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.prepare.outputs.max_parallel) }}
+      matrix:
+        batch: ${{ fromJSON(needs.prepare.outputs.batches) }}
+    env:
+      CORPUS_MODE: '1'
+      MFL_RATE_LIMIT_PER_MIN: ${{ inputs.mfl_rate_limit }}
+      PYTHONPATH: ${{ github.workspace }}/code/fantasy_football_data_scripts
+      OPS_CACHE_PATH: ${{ github.workspace }}/corpus_dependencies/ops_cache.duckdb
+      DRAFT_GLOBAL_SOURCE_PATH: ${{ github.workspace }}/corpus_dependencies/draft_global_source.parquet
+      CORPUS_DEPENDENCY_DIR: ${{ github.workspace }}/corpus_dependencies
+      CORPUS_DEPENDENCY_KEY: corpus-dependencies-v1-Linux-20260717
+      MFL_PLAYER_CACHE_KEY: ${{ inputs.cache_namespace }}-players-${{ inputs.batch_start }}-${{ inputs.batch_count }}
+    steps:
+      - name: Checkout worker
+        uses: actions/checkout@v5
+        with:
+          path: worker
+      - name: Checkout private pipeline
+        uses: actions/checkout@v5
+        with:
+          repository: jeleff1000/yahoo_oauth
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.yahoo_oauth_ref }}
+          path: code
+          filter: blob:none
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /corpus_seed/
+            /fantasy_football_data_scripts/
+            /scripts/extraplatform_corpus/
+            /requirements.txt
+            /pyproject.toml
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: code/requirements.txt
+      - name: Install dependencies
+        run: pip install -r code/requirements.txt
+      - name: Restore corpus dependencies
+        id: deps
+        uses: actions/cache/restore@v5
+        with:
+          path: corpus_dependencies
+          key: corpus-dependencies-v1-Linux-20260717
+      - name: Require offline dependency cache
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: exit 1
+      - name: Restore MFL player catalog cache
+        uses: actions/cache/restore@v5
+        with:
+          path: mfl_player_cache
+          key: ${{ env.MFL_PLAYER_CACHE_KEY }}
+          restore-keys: |
+            ${{ inputs.cache_namespace }}-players-
+      - name: Run validated MFL batch
+        env:
+          MANIFEST: code/${{ inputs.manifest_path }}
+          BATCH_START: ${{ inputs.batch_start }}
+          BATCH: ${{ matrix.batch }}
+          BATCH_SIZE: ${{ inputs.batch_size }}
+          STAGGER: ${{ inputs.start_stagger_seconds }}
+          MAX_PARALLEL: ${{ inputs.max_parallel }}
+          MFL_PLAYERS_CACHE_DIR: ${{ github.workspace }}/mfl_player_cache
+        run: |
+          mkdir -p batch_output
+          delay=$(( (BATCH % MAX_PARALLEL) * STAGGER ))
+          echo "[batch] delaying ${delay}s to spread MFL requests"
+          sleep "$delay"
+          timeout --signal=TERM --kill-after=30s 1800s python code/scripts/extraplatform_corpus/mfl_register_batch.py \
+            --manifest "$MANIFEST" \
+            --offset "$(( (BATCH - BATCH_START) * BATCH_SIZE + BATCH_START * BATCH_SIZE ))" \
+            --limit "$BATCH_SIZE" \
+            --output batch_output \
+            --code-root code
+      - name: Upload batch receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mfl-register-batch-${{ matrix.batch }}
+          retention-days: 30
+          path: |
+            batch_output/*/league.duckdb
+            batch_output/*/receipt.json
+            batch_output/*/import.log
+            batch_output/batch_receipt.json
+            mfl_player_cache
+
+  combine:
+    needs: [prepare, ingest]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Download batch artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mfl-register-batch-*
+          path: receipts
+          merge-multiple: false
+      - name: Checkout canonical schema
+        uses: actions/checkout@v5
+        with:
+          repository: jeleff1000/yahoo_oauth
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.yahoo_oauth_ref }}
+          path: code
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /fantasy_football_data_scripts/multi_league/core/canonical_player.py
+            /scripts/extraplatform_corpus/merge_mfl_chunk.py
+            /corpus_seed/
+      - name: Restore prior MFL player catalog cache
+        uses: actions/cache/restore@v5
+        with:
+          path: mfl_player_cache
+          key: ${{ inputs.cache_namespace }}-players-${{ inputs.batch_start }}-${{ inputs.batch_count }}
+          restore-keys: |
+            ${{ inputs.cache_namespace }}-players-
+      - name: Restore prior cumulative register state
+        if: ${{ inputs.storage_mode != 'chunked' && inputs.batch_start != '0' && inputs.prior_state_key != '' }}
+        uses: actions/cache/restore@v5
+        with:
+          path: prior_state
+          key: ${{ inputs.prior_state_key }}
+      - name: Restore prior chunk index
+        if: ${{ inputs.storage_mode == 'chunked' && inputs.batch_start != '0' && inputs.prior_index_key != '' }}
+        uses: actions/cache/restore@v5
+        with:
+          # The cache version includes the path.  Restore to the same path
+          # that is used by the save step, then let the merger read it there.
+          path: index_state
+          key: ${{ inputs.prior_index_key }}
+      - name: Merge player catalogs from ingest runners
+        shell: bash
+        run: |
+          mkdir -p mfl_player_cache
+          find receipts -type f -name 'mfl_players_*.json' -print0 | while IFS= read -r -d '' src; do
+            name="$(basename "$src")"
+            test -s "mfl_player_cache/$name" || cp "$src" "mfl_player_cache/$name"
+          done
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install DuckDB
+        run: pip install duckdb
+      - name: Build canonical batch snapshot
+        if: ${{ inputs.storage_mode != 'chunked' }}
+        env:
+          EXPECTED: ${{ needs.prepare.outputs.records }}
+          ACCEPTED_BY_YEAR: ${{ inputs.accepted_by_year }}
+          TARGET_PER_YEAR: ${{ inputs.target_per_year }}
+          TARGET_YEARS: ${{ inputs.target_years }}
+          COLLECT_ALL: ${{ inputs.collect_all }}
+          PYTHONPATH: ${{ github.workspace }}/code/fantasy_football_data_scripts
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, duckdb, os
+          from multi_league.core.canonical_player import PLAYER_FANTASY_COLUMNS
+          expected=json.loads(os.environ['EXPECTED']); root=pathlib.Path('receipts')
+          pairs=[]; receipts=[]
+          for receipt_path in sorted(root.rglob('receipt.json')):
+              r=json.loads(receipt_path.read_text(encoding='utf-8')); receipts.append(r)
+              pairs.append((receipt_path.parent/'league.duckdb',r))
+          keys={(int(r['season']),str(r['league_id'])) for r in expected}
+          got={(int(r['season']),str(r['league_id'])) for r in receipts}
+          if not got: raise SystemExit('batch wave produced no valid receipts')
+          prior_root=pathlib.Path('prior_state')
+          prior_json={}
+          prior_path=prior_root/'mfl_register_all_runs.json'
+          prior_db=prior_root/'mfl_register_snapshot.duckdb'
+          if prior_path.is_file():
+              prior_json=json.loads(prior_path.read_text(encoding='utf-8'))
+          prior_leagues=list(prior_json.get('leagues', []))
+          prior_rejected=list(prior_json.get('rejected', []))
+          expected_by_key={(int(r['season']),str(r['league_id'])):r for r in expected}
+          prior_by_key={(int(r['season']),str(r['league_id'])):r for r in prior_leagues}
+          current_by_key={(int(r['season']),str(r['league_id'])):r for r in receipts}
+          if len(current_by_key) != len(receipts):
+              raise SystemExit('duplicate successful receipt keys in batch')
+          for key, old in prior_by_key.items():
+              new=current_by_key.get(key)
+              if new is not None and old.get('lineage_id') and new.get('lineage_id') and old['lineage_id'] != new['lineage_id']:
+                  raise SystemExit(f'lineage changed for {key}: {old["lineage_id"]} -> {new["lineage_id"]}')
+          for key, receipt in current_by_key.items():
+              manifest=expected_by_key.get(key)
+              if manifest is None:
+                  raise SystemExit(f'receipt not present in manifest: {key}')
+              if manifest.get('lineage_id') and receipt.get('lineage_id') != manifest['lineage_id']:
+                  raise SystemExit(f'receipt lineage mismatch for {key}')
+          print(f'validated {len(got)}/{len(keys)} candidates; rejected {len(keys-got)}')
+          prior={str(k):int(v) for k,v in json.loads(os.environ.get('ACCEPTED_BY_YEAR','{}') or '{}').items()}
+          for year,count in __import__('collections').Counter(int(r['season']) for r in receipts).items():
+              prior[str(year)]=prior.get(str(year),0)+count
+          target=int(os.environ.get('TARGET_PER_YEAR','10000'))
+          target_years=[y.strip() for y in os.environ.get('TARGET_YEARS','').split(',') if y.strip()]
+          collect_all=os.environ.get('COLLECT_ALL','false').lower() == 'true'
+          complete_targets=(not collect_all) and bool(target_years) and all(prior.get(y,0)>=target for y in target_years)
+          schema_by_table={}
+          before_rows={}
+          added_rows={table:0 for table in ('league_settings','matchup','player_fantasy')}
+          if prior_db.is_file():
+              prior_read=duckdb.connect(str(prior_db), read_only=True)
+              for table in ('league_settings','matchup','player_fantasy'):
+                  if prior_read.execute("select count(*) from information_schema.tables where table_schema='main' and table_name=?",[table]).fetchone()[0]:
+                      schema_by_table[table]=tuple(r[0] for r in prior_read.execute(f'describe "{table}"').fetchall())
+                      before_rows[table]=int(prior_read.execute(f'select count(*) from "{table}"').fetchone()[0])
+              prior_read.close()
+          out=duckdb.connect('mfl_register_snapshot.duckdb')
+          if prior_db.is_file():
+              out.execute(f"ATTACH '{prior_db.as_posix()}' AS prior (READ_ONLY)")
+              for table in ('league_settings','matchup','player_fantasy'):
+                  if out.execute("select count(*) from information_schema.tables where table_catalog='prior' and table_schema='main' and table_name=?",[table]).fetchone()[0]:
+                      out.execute(f'create table "{table}" as select * from prior."{table}"')
+              out.execute('DETACH prior')
+          for db,r in pairs:
+              out.execute(f"ATTACH '{db.as_posix()}' AS src (READ_ONLY)")
+              for table in ('league_settings','matchup','player_fantasy'):
+                  if not out.execute("select count(*) from information_schema.tables where table_catalog='src' and table_schema='public' and table_name=?",[table]).fetchone()[0]: continue
+                  source_schema=tuple(x[0] for x in out.execute(f'describe src.public."{table}"').fetchall())
+                  if table in schema_by_table and schema_by_table[table] != source_schema:
+                      raise SystemExit(f'cache schema changed for {table}')
+                  schema_by_table.setdefault(table, source_schema)
+                  added_rows[table] += int(out.execute(f'select count(*) from src.public."{table}" where year={int(r["season"])}').fetchone()[0])
+                  if not out.execute("select count(*) from information_schema.tables where table_schema='main' and table_name=?",[table]).fetchone()[0]:
+                      out.execute(f'create table "{table}" as select * from src.public."{table}" where year={int(r["season"])}')
+                  else: out.execute(f'insert into "{table}" select * from src.public."{table}" where year={int(r["season"])}')
+              out.execute('DETACH src')
+          out.close()
+          current_rejected=[{'season':y,'league_id':lid} for y,lid in sorted(keys-got)]
+          all_leagues=prior_leagues + receipts
+          all_rejected=prior_rejected + current_rejected
+          all_by_key={(int(r['season']),str(r['league_id'])):r for r in all_leagues}
+          if len(all_by_key) != len(all_leagues):
+              raise SystemExit('duplicate league-year key in cumulative cache')
+          if not set(prior_by_key).issubset(all_by_key):
+              raise SystemExit('prior cache rows were removed')
+          if set(prior_by_key) & set(current_by_key) and not set(prior_by_key).isdisjoint(current_by_key):
+              raise SystemExit('batch attempted to append an existing league-year key')
+          final_read=duckdb.connect('mfl_register_snapshot.duckdb', read_only=True)
+          final_rows={table:int(final_read.execute(f'select count(*) from "{table}"').fetchone()[0]) for table in added_rows if final_read.execute("select count(*) from information_schema.tables where table_schema='main' and table_name=?",[table]).fetchone()[0]}
+          final_read.close()
+          for table, added in added_rows.items():
+              if final_rows.get(table,0) - before_rows.get(table,0) != added:
+                  raise SystemExit(f'cache append row-count mismatch for {table}')
+          if set(schema_by_table.get('player_fantasy',())) != set(PLAYER_FANTASY_COLUMNS):
+              raise SystemExit('player_fantasy cache schema is not canonical')
+          pathlib.Path('cache_append_proof.json').write_text(json.dumps({'schema_unchanged':True,'prior_rows':before_rows,'added_rows':added_rows,'final_rows':final_rows,'prior_league_count':len(prior_leagues),'added_league_count':len(receipts),'final_league_count':len(all_leagues),'prior_rows_preserved':set(prior_by_key).issubset(all_by_key),'new_lineage':False,'duplicate_league_year_keys':False},indent=2,sort_keys=True),encoding='utf-8')
+          pathlib.Path('mfl_register_all_runs.json').write_text(json.dumps({'schema_version':'mfl_register_results_v1','expected_count':int(prior_json.get('expected_count',0))+len(keys),'league_count':len(all_leagues),'rejected_count':len(all_rejected),'rejected':all_rejected,'accepted_by_year':prior,'target_per_year':target,'target_years':target_years,'complete_targets':complete_targets,'collect_all':collect_all,'leagues':sorted(all_leagues,key=lambda r:(int(r['season']),str(r['league_id'])))},indent=2,sort_keys=True),encoding='utf-8')
+          PY
+      - name: Build immutable canonical cache chunk
+        if: ${{ inputs.storage_mode == 'chunked' }}
+        env:
+          EXPECTED_PATH: ${{ github.workspace }}/code/${{ inputs.manifest_path }}
+          CHUNK_KEY: ${{ inputs.cache_namespace }}-chunk-${{ inputs.batch_start }}-${{ inputs.batch_count }}
+          PYTHONPATH: ${{ github.workspace }}/code/fantasy_football_data_scripts
+        run: |
+          python3 code/scripts/extraplatform_corpus/merge_mfl_chunk.py \
+            --receipts receipts \
+            --expected "$EXPECTED_PATH" \
+            --prior-index index_state/mfl_register_all_runs.json \
+            --output-db mfl_register_chunk.duckdb \
+            --output-index mfl_register_all_runs.json \
+            --proof cache_append_proof.json \
+            --chunk-key "$CHUNK_KEY"
+      - name: Stage cumulative register state
+        if: ${{ inputs.storage_mode != 'chunked' }}
+        shell: bash
+        run: |
+          mkdir -p prior_state
+          cp mfl_register_snapshot.duckdb prior_state/
+          cp mfl_register_all_runs.json prior_state/
+          cp cache_append_proof.json prior_state/
+      - name: Save validated batch cache
+        if: ${{ inputs.storage_mode != 'chunked' }}
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            prior_state
+          key: ${{ inputs.cache_namespace }}-state-${{ inputs.batch_start }}-${{ inputs.batch_count }}
+      - name: Save MFL player catalog cache
+        uses: actions/cache/save@v5
+        with:
+          path: mfl_player_cache
+          key: ${{ inputs.cache_namespace }}-players-${{ inputs.batch_start }}-${{ inputs.batch_count }}
+      - name: Stage immutable chunk cache
+        if: ${{ inputs.storage_mode == 'chunked' }}
+        shell: bash
+        run: |
+          mkdir -p chunk_state index_state
+          cp mfl_register_chunk.duckdb chunk_state/
+          cp cache_append_proof.json chunk_state/
+          cp mfl_register_all_runs.json index_state/
+          cp cache_append_proof.json index_state/
+      - name: Save immutable chunk cache
+        if: ${{ inputs.storage_mode == 'chunked' }}
+        uses: actions/cache/save@v5
+        with:
+          path: chunk_state
+          key: ${{ inputs.cache_namespace }}-chunk-${{ inputs.batch_start }}-${{ inputs.batch_count }}
+      - name: Save immutable chunk index
+        if: ${{ inputs.storage_mode == 'chunked' }}
+        uses: actions/cache/save@v5
+        with:
+          path: index_state
+          key: ${{ inputs.cache_namespace }}-index-${{ inputs.batch_start }}-${{ inputs.batch_count }}
+      - name: Upload batch snapshot
+        if: ${{ inputs.storage_mode != 'chunked' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mfl-register-batch-final-${{ github.run_id }}
+          retention-days: 90
+          path: |
+            mfl_register_snapshot.duckdb
+            mfl_register_all_runs.json
+            cache_append_proof.json
+      - name: Upload immutable chunk snapshot
+        if: ${{ inputs.storage_mode == 'chunked' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mfl-register-chunk-${{ github.run_id }}
+          retention-days: 90
+          path: |
+            mfl_register_chunk.duckdb
+            mfl_register_all_runs.json
+            cache_append_proof.json
+  verify_cache:
+    needs: [combine]
+    if: ${{ needs.combine.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore exact saved cumulative cache
+        if: ${{ inputs.storage_mode != 'chunked' }}
+        uses: actions/cache/restore@v5
+        with:
+          path: prior_state
+          key: ${{ inputs.cache_namespace }}-state-${{ inputs.batch_start }}-${{ inputs.batch_count }}
+          fail-on-cache-miss: true
+      - name: Restore exact saved chunk
+        if: ${{ inputs.storage_mode == 'chunked' }}
+        uses: actions/cache/restore@v5
+        with:
+          path: chunk_state
+          key: ${{ inputs.cache_namespace }}-chunk-${{ inputs.batch_start }}-${{ inputs.batch_count }}
+          fail-on-cache-miss: true
+      - name: Restore exact saved chunk index
+        if: ${{ inputs.storage_mode == 'chunked' }}
+        uses: actions/cache/restore@v5
+        with:
+          path: index_state
+          key: ${{ inputs.cache_namespace }}-index-${{ inputs.batch_start }}-${{ inputs.batch_count }}
+          fail-on-cache-miss: true
+      - name: Validate live cumulative cache append proof
+        if: ${{ inputs.storage_mode != 'chunked' }}
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          root=pathlib.Path('prior_state')
+          proof=json.loads((root/'cache_append_proof.json').read_text(encoding='utf-8'))
+          required={'schema_unchanged':True,'prior_rows_preserved':True,'new_lineage':False,'duplicate_league_year_keys':False}
+          for key,value in required.items():
+              if proof.get(key) != value:
+                  raise SystemExit(f'live cache proof failed: {key}={proof.get(key)!r}')
+          for table,before in proof['prior_rows'].items():
+              added=proof['added_rows'].get(table,0)
+              final=proof['final_rows'].get(table,0)
+              if final-before != added:
+                  raise SystemExit(f'live cache proof row delta failed: {table}')
+           print(json.dumps({'live_cache_validated':True, **proof}, sort_keys=True))
+           PY
+      - name: Validate live chunk append proof
+        if: ${{ inputs.storage_mode == 'chunked' }}
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          chunk=pathlib.Path('chunk_state')
+          index=pathlib.Path('index_state')
+          proof=json.loads((chunk/'cache_append_proof.json').read_text(encoding='utf-8'))
+          register=json.loads((index/'mfl_register_all_runs.json').read_text(encoding='utf-8'))
+          required={'schema_unchanged':True,'prior_rows_preserved':True,'new_lineage':False,'duplicate_league_year_keys':False}
+          for key,value in required.items():
+              if proof.get(key) != value:
+                  raise SystemExit(f'live chunk proof failed: {key}={proof.get(key)!r}')
+          if register.get('league_count') != proof.get('final_league_count'):
+              raise SystemExit('live chunk index league count mismatch')
+          if not any(c.get('cache_key') == proof.get('chunk_cache_key') for c in register.get('chunks', [])):
+              raise SystemExit('live chunk index does not reference the saved chunk')
+          for table,before in proof['prior_rows'].items():
+              if proof['final_rows'].get(table,0)-before != proof['added_rows'].get(table,0):
+                  raise SystemExit(f'live chunk row delta failed: {table}')
+          print(json.dumps({'live_cache_validated':True, **proof}, sort_keys=True))
+          PY
+      - name: Dispatch next batch wave after live validation
+        if: ${{ inputs.continue_population == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          MANIFEST_PATH: ${{ inputs.manifest_path }}
+          YAHOO_OAUTH_REF: ${{ inputs.yahoo_oauth_ref }}
+          BATCH_START: ${{ inputs.batch_start }}
+          BATCH_COUNT: ${{ inputs.batch_count }}
+          BATCH_SIZE: ${{ inputs.batch_size }}
+          POPULATION_TOTAL: ${{ inputs.population_total }}
+          CACHE_NAMESPACE: ${{ inputs.cache_namespace }}
+          TARGET_PER_YEAR: ${{ inputs.target_per_year }}
+          TARGET_YEARS: ${{ inputs.target_years }}
+          MAX_PARALLEL: ${{ inputs.max_parallel }}
+          MFL_RATE: ${{ inputs.mfl_rate_limit }}
+          STAGGER: ${{ inputs.start_stagger_seconds }}
+          COLLECT_ALL: ${{ inputs.collect_all }}
+          CURRENT_STATE_KEY: ${{ inputs.cache_namespace }}-state-${{ inputs.batch_start }}-${{ inputs.batch_count }}
+          CURRENT_INDEX_KEY: ${{ inputs.cache_namespace }}-index-${{ inputs.batch_start }}-${{ inputs.batch_count }}
+          STORAGE_MODE: ${{ inputs.storage_mode }}
+        run: |
+          if [ "$STORAGE_MODE" = chunked ]; then ROOT=index_state; else ROOT=prior_state; fi
+          export ROOT
+          state=$(python3 -c 'import json,os; print(json.dumps(json.load(open(os.path.join(os.environ["ROOT"],"mfl_register_all_runs.json"),encoding="utf-8")).get("accepted_by_year",{}),separators=(",",":")))')
+          complete=$(python3 -c 'import json,os; d=json.load(open(os.path.join(os.environ["ROOT"],"mfl_register_all_runs.json"),encoding="utf-8")); print("true" if d.get("complete_targets") else "false")')
+          total=${POPULATION_TOTAL:-0}; next=$((BATCH_START+BATCH_COUNT))
+          if [ "$complete" = true ] || [ "$total" -le 0 ] || [ "$((next*BATCH_SIZE))" -ge "$total" ]; then exit 0; fi
+          gh workflow run mfl_register_batch_campaign.yml --repo "$REPOSITORY" --ref "$REF_NAME" \
+            --raw-field manifest_path="$MANIFEST_PATH" --raw-field yahoo_oauth_ref="$YAHOO_OAUTH_REF" \
+            --raw-field batch_start="$next" --raw-field batch_count="$BATCH_COUNT" --raw-field batch_size="$BATCH_SIZE" \
+            --raw-field max_parallel="$MAX_PARALLEL" --raw-field cache_namespace="$CACHE_NAMESPACE" \
+            --raw-field continue_population=true --raw-field population_total="$total" \
+            --raw-field accepted_by_year="$state" --raw-field target_per_year="$TARGET_PER_YEAR" \
+            --raw-field target_years="$TARGET_YEARS" --raw-field mfl_rate_limit="$MFL_RATE" \
+            --raw-field start_stagger_seconds="$STAGGER" --raw-field collect_all="$COLLECT_ALL" \
+            --raw-field storage_mode="$STORAGE_MODE" --raw-field prior_state_key="$CURRENT_STATE_KEY" \
+            --raw-field prior_index_key="$CURRENT_INDEX_KEY"
